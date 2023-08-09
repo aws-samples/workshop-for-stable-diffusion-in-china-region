@@ -1,0 +1,198 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  DDBTableName:
+    Type: String
+    Default: AIGC_CONFIG
+  CloudfrontCNAME:
+    Type: String
+Resources:
+  DDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Ref: DDBTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: PK
+        AttributeType: S
+      - AttributeName: SM_ENDPOINT
+        AttributeType: S
+      KeySchema:
+      - AttributeName: PK
+        KeyType: HASH
+      - AttributeName: SM_ENDPOINT
+        KeyType: RANGE
+    Metadata:
+      SamResourceId: DDBTable
+  StableDiffusionInferenceFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: DDBTable
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      CodeUri: lambda-stable-diffusion/
+      Environment:
+        Variables:
+          SM_REGION:
+            Fn::Sub: ${AWS::Region}
+          S3_BUCKET:
+            Fn::Sub: sagemaker-${AWS::Region}-${AWS::AccountId}
+          S3_PREFIX: stablediffusion/asyncinvoke
+          DDB_TABLE:
+            Ref: DDBTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            PayloadFormatVersion: '1.0'
+            Path: /{proxy+}
+            Method: any
+      Timeout: 120
+      Policies:
+      - AmazonDynamoDBFullAccess
+      - AWSLambdaExecute
+      - AmazonS3FullAccess
+      - AmazonSageMakerFullAccess
+    Metadata:
+      SamResourceId: StableDiffusionInferenceFunction
+  OriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: AIGC OAI
+    Metadata:
+      SamResourceId: OriginAccessIdentity
+  SageMakerDefaultBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Fn::Sub: sagemaker-${AWS::Region}-${AWS::AccountId}
+      PolicyDocument:
+        Statement:
+        - Action: s3:Get*
+          Effect: Allow
+          Resource:
+            Fn::Sub: arn:aws-cn:s3:::sagemaker-${AWS::Region}-${AWS::AccountId}/*
+          Principal:
+            CanonicalUser:
+              Fn::GetAtt:
+              - OriginAccessIdentity
+              - S3CanonicalUserId
+    Metadata:
+      SamResourceId: SageMakerDefaultBucketPolicy
+  CloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        PriceClass: PriceClass_All
+        IPV6Enabled: false
+        HttpVersion: http2
+        Origins:
+          - Id: APIOrigin
+            DomainName: !Sub "${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com.cn"
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+          - Id: S3Origin  
+            DomainName: !Sub "sagemaker-${AWS::Region}-${AWS::AccountId}.s3.${AWS::Region}.amazonaws.com.cn"
+            S3OriginConfig:
+              OriginAccessIdentity: !Join ["", ["origin-access-identity/cloudfront/", !Ref OriginAccessIdentity]]
+        Aliases: 
+        - Ref: CloudfrontCNAME
+        Enabled: true
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ViewerProtocolPolicy: allow-all
+          TargetOriginId: APIOrigin
+          DefaultTTL: 0
+          MinTTL: 0
+          MaxTTL: 0
+          ForwardedValues: 
+            Cookies:
+              Forward: none
+            QueryString: false
+        CacheBehaviors:
+          - PathPattern: "/stablediffusion/*"
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ViewerProtocolPolicy: allow-all
+            TargetOriginId: S3Origin
+            #CachePolicyId: !Ref 3hCachePolicy
+            DefaultTTL: 10800
+            MinTTL: 10800
+            MaxTTL: 10800
+            ForwardedValues: 
+              Cookies:
+                Forward: none
+              Headers:
+              - "x-forwarded-for"
+              QueryString: true
+              QueryStringCacheKeys: 
+              - "allowed_query_string_param"
+          - PathPattern: "/aigc/*"
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ViewerProtocolPolicy: allow-all
+            TargetOriginId: S3Origin
+            #CachePolicyId: !Ref 3hCachePolicy
+            DefaultTTL: 10800
+            MinTTL: 10800
+            MaxTTL: 10800
+            ForwardedValues: 
+              Cookies:
+                Forward: none
+              Headers:
+              - "x-forwarded-for"
+              QueryString: true
+              QueryStringCacheKeys: 
+              - "allowed_query_string_param"
+          - PathPattern: "/task/*"
+            AllowedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ViewerProtocolPolicy: allow-all
+            TargetOriginId: APIOrigin
+            DefaultTTL: 0
+            MinTTL: 0
+            MaxTTL: 0
+            ForwardedValues: 
+              Cookies:
+                Forward: none
+              QueryString: false
+    Metadata:
+      SamResourceId: CloudfrontDistribution
+Outputs:
+  DistributionDomainName:
+    Description: Distribution domain name
+    Value:
+      Fn::GetAtt:
+      - CloudfrontDistribution
+      - DomainName
+  InvokeApi:
+    Description: API Gateway endpoint URL
+    Value:
+      Fn::Sub: https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com.cn
